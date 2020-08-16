@@ -34,7 +34,7 @@ if os.path.exists('scripts/dtrx') and os.path.exists('tests'):
 elif os.path.exists('../scripts/dtrx') and os.path.exists('../tests'):
     pass
 else:
-    print "ERROR: Can't run tests in this directory!"
+    print ("ERROR: Can't run tests in this directory!")
     sys.exit(2)
 
 DTRX_SCRIPT = os.path.realpath('../scripts/dtrx')
@@ -132,7 +132,7 @@ class ExtractorTest(object):
             last_part = ''
         else:
             last_part = ': %s' % (message,)
-        print "%7s: %s%s" % (status, self.name, last_part)
+        print ("%7s: %s%s" % (status, self.name, last_part))
         return raw_status
 
     def compare_results(self, actual):
@@ -227,6 +227,6 @@ for outcome in OUTCOMES:
     counts[outcome] = 0
 for result in results:
     counts[result] += 1
-print " Totals:", ', '.join(["%s %s" % (counts[key], key) for key in OUTCOMES])
+print (" Totals:", ', '.join(["%s %s" % (counts[key], key) for key in OUTCOMES]))
 if counts["error"] + counts["failed"] > 0:
     sys.exit(1)
