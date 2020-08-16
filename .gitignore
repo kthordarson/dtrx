@@ -1,1 +1,4 @@
 .vscode/*
+tests/trickery.tar.gz
+tests/test-recursive-no-prompt/*
+tests/test-recursive-no-prompt

@@ -19,7 +19,7 @@
 # with this program; if not, see <http://www.gnu.org/licenses/>.
 
 # Python 2.3 string methods: 'rfind', 'rindex', 'rjust', 'rstrip'
-
+import operator
 import errno
 import fcntl
 import logging
@@ -87,6 +87,9 @@ mimetypes.types_map.setdefault('.gem', 'application/x-ruby-gem')
 
 logger = logging.getLogger('dtrx-log')
 
+def cmp(a, b):
+    return (a > b) - (a < b) 
+
 class FilenameChecker(object):
 	free_func = os.open
 	free_args = (os.O_CREAT | os.O_EXCL,)
@@ -145,7 +148,7 @@ class BaseExtractor(object):
 	name_checker = DirectoryChecker
 
 	def __init__(self, filename, encoding):
-		if encoding and (not self.decoders.has_key(encoding)):
+		if encoding and (encoding not in self.decoders):
 			raise ValueError("unrecognized encoding %s" % (encoding,))
 		self.filename = os.path.realpath(filename)
 		self.encoding = encoding
@@ -249,12 +252,12 @@ class BaseExtractor(object):
 		# 2. Then remove any commonly known extension that remains.
 		# 3. If neither of those did anything, remove anything that looks
 		#    like it's almost certainly an extension (less than 5 chars).
-		if mimetypes.encodings_map.has_key(extension):
+		if extension in mimetypes.encodings_map:
 			pieces.pop()
 			extension = '.' + pieces[-1]
-		if (mimetypes.types_map.has_key(extension) or
-			mimetypes.common_types.has_key(extension) or
-			mimetypes.suffix_map.has_key(extension)):
+		if (extension in mimetypes.types_map or
+			extension in mimetypes.common_types or
+			extension in mimetypes.suffix_map):
 			pieces.pop()
 		if ((orig_len == len(pieces)) and
 			(orig_len > 1) and (len(pieces[-1]) < 5)):
@@ -278,14 +281,10 @@ class BaseExtractor(object):
 
 	def check_success(self, got_files):
 		error_index, error_code = self.first_bad_exit_code()
-		logger.debug("success results: %s %s %s" % (got_files, error_index,
-													self.exit_codes))
-		if (self.is_fatal_error(error_code) or
-			((not got_files) and (error_code is not None))):
+		logger.debug("success results: %s %s %s" % (got_files, error_index, self.exit_codes))
+		if (self.is_fatal_error(error_code) or ((not got_files) and (error_code is not None))):
 			command = ' '.join(self.pipes[error_index][0])
-			raise ExtractorError("%s error: '%s' returned status code %s" %
-								 (self.pipes[error_index][1], command,
-								  error_code))
+			raise ExtractorError("%s error: '%s' returned status code %s" % (self.pipes[error_index][1], command, error_code))
 		
 	def extract_archive(self):
 		self.pipe(self.extract_pipe)
@@ -322,7 +321,7 @@ class BaseExtractor(object):
 			stdin = processes[-1].stdout
 		get_output_line = processes[-1].stdout.readline
 		while True:
-			line = get_output_line()
+			line = get_output_line().decode('utf-8')
 			if not line:
 				break
 			yield line.rstrip('\n')
@@ -340,7 +339,7 @@ class CompressionExtractor(BaseExtractor):
 	def basename(self):
 		pieces = os.path.basename(self.filename).split('.')
 		extension = '.' + pieces[-1]
-		if mimetypes.encodings_map.has_key(extension):
+		if extension in mimetypes.encodings_map:
 			pieces.pop()
 		return '.'.join(pieces)
 
@@ -509,7 +508,8 @@ class ZipExtractor(NoPipeExtractor):
 	list_command = ['zipinfo', '-1']
 
 	def is_fatal_error(self, status):
-		return status > 1
+		if status is not None:
+			return status > 1
 
 
 class LZHExtractor(ZipExtractor):
@@ -771,7 +771,7 @@ class BasePolicy(object):
 		while True:
 			print ("\n".join(question))
 			try:
-				answer = raw_input(self.prompt)
+				answer = input(self.prompt)
 			except EOFError:
 				return self.answers['']
 			try:
@@ -976,7 +976,7 @@ class ExtractorBuilder(object):
 
 	def build_extractor(self, archive_type, encoding):
 		type_info = self.extractor_map[archive_type]
-		if self.options.metadata and type_info.has_key('metadata'):
+		if self.options.metadata and 'metadata' in type_info:
 			extractors = type_info['metadata']
 		else:
 			extractors = type_info['extractors']
@@ -1014,7 +1014,7 @@ class ExtractorBuilder(object):
 	try_by_mimetype = classmethod(try_by_mimetype)
 
 	def magic_map_matches(cls, output, magic_map):
-		return [result for regexp, result in magic_map.items()
+		return [result for regexp, result in  list(magic_map.items())
 				if regexp.search(output)]
 	magic_map_matches = classmethod(magic_map_matches)
 		
@@ -1023,7 +1023,7 @@ class ExtractorBuilder(object):
 		status = process.wait()
 		if status != 0:
 			return []
-		output = process.stdout.readline()
+		output = str(process.stdout.readline())
 		process.stdout.close()
 		if output.startswith('%s: ' % filename):
 			output = output[len(filename) + 2:]
@@ -1095,7 +1095,7 @@ class ExtractionAction(BaseAction):
 			return cmp(y, x)
 		if self.current_handler.target == '.':
 			filenames = extractor.contents
-			filenames.sort(reverser)
+			filenames.sort()
 		else:
 			filenames = [self.current_handler.target]
 		pathjoin = os.path.join
@@ -1105,7 +1105,7 @@ class ExtractionAction(BaseAction):
 			if isdir(filename):
 				print ("%s/" % (filename,))
 				new_filenames = os.listdir(filename)
-				new_filenames.sort(reverser)
+				new_filenames.sort()
 				filenames.extend([pathjoin(filename, new_filename) for new_filename in new_filenames])
 			else:
 				print (filename)
@@ -1127,7 +1127,7 @@ class ListAction(BaseAction):
 		# basic error before we show what filename we're listing.
 		filename_lister = extractor.get_filenames()
 		try:
-			first_line = filename_lister.next()
+			first_line = next(filename_lister)
 		except StopIteration:
 			self.show_filename(filename)
 		else:
@@ -1261,8 +1261,7 @@ class ExtractorApplication(object):
 
 	def show_stderr(self, logger_func, stderr):
 		if stderr:
-			logger_func("Error output from this process:\n" +
-						stderr.rstrip('\n'))
+			logger_func(f"Error output from this process: {stderr}")
 
 	def try_extractors(self, filename, builder):
 		errors = []
@@ -1308,7 +1307,7 @@ class ExtractorApplication(object):
 			action = ListAction
 		else:
 			action = ExtractionAction
-		self.action = action(self.options, self.archives.values()[0])
+		self.action = action(self.options, self.archives.values())
 		while self.archives:
 			self.current_directory, self.filenames = self.archives.popitem()
 			os.chdir(self.current_directory)
