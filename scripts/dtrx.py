@@ -20,11 +20,12 @@ import textwrap
 import traceback
 from urllib import parse as urlparse
 from loguru import logger
-VERSION = '7.2'
+from functools import cmp_to_key, total_ordering
+VERSION = "8.5.1"
 VERSION_BANNER = '''dtrx version %s
 Copyright © 2006-2011 Brett Smith <brettcsmith@brettcsmith.org>
 Copyright © 2008 Peter Kelemen <Peter.Kelemen@gmail.com>
-Copyright © 2022 kthordarson@gmail.com
+Copyright © 2023 kthordarson@gmail.com
 .''' % (VERSION,)
 
 MATCHING_DIRECTORY = 1
@@ -46,11 +47,14 @@ RECURSE_NOT_NOW = 3
 RECURSE_NEVER = 4
 RECURSE_LIST = 5
 
-mimetypes.encodings_map.setdefault('.bz2', 'bzip2')
-mimetypes.encodings_map.setdefault('.lzma', 'lzma')
-mimetypes.encodings_map.setdefault('.xz', 'xz')
-mimetypes.encodings_map.setdefault('.lz', 'lzip')
-mimetypes.types_map.setdefault('.gem', 'application/x-ruby-gem')
+mimetypes.encodings_map.setdefault(".bz2", "bzip2")
+mimetypes.encodings_map.setdefault(".lzma", "lzma")
+mimetypes.encodings_map.setdefault(".xz", "xz")
+mimetypes.encodings_map.setdefault(".lz", "lzip")
+mimetypes.encodings_map.setdefault(".lrz", "lrzip")
+mimetypes.encodings_map.setdefault(".zst", "zstd")
+mimetypes.encodings_map.setdefault(".zstd", "zstd")
+mimetypes.types_map.setdefault(".gem", "application/x-ruby-gem")
 
 # logger = logging.getLogger('dtrx-log')
 
@@ -77,8 +81,7 @@ class FilenameChecker(object):
 		return True
 
 	def create(self):
-		fd, filename = tempfile.mkstemp(prefix=self.original_name + '.',
-										dir='.')
+		fd, filename = tempfile.mkstemp(prefix=self.original_name + '.', dir='.')
 		os.close(fd)
 		return filename
 
@@ -110,8 +113,8 @@ class ExtractorUnusable(Exception):
 EXTRACTION_ERRORS = (ExtractorError, ExtractorUnusable, OSError, IOError)
 
 class BaseExtractor(object):
-	decoders = {'bzip2': ['bzcat'], 'gzip': ['zcat'], 'compress': ['zcat'],
-				'lzma': ['lzcat'], 'xz': ['xzcat'], 'lzip': ['lzip', '-cd']}
+	#decoders = {'bzip2': ['bzcat'], 'gzip': ['zcat'], 'compress': ['zcat'], 'lzma': ['lzcat'], 'xz': ['xzcat'], 'lzip': ['lzip', '-cd']}
+	decoders = {"bzip2": ["bzcat"], "gzip": ["zcat"], "compress": ["zcat"], "lzma": ["lzcat"], "xz": ["xzcat"], "lzip": ["lzip", "-cd"], "zstd": ["zstd", "-d"], "br": ["br", "--decompress"],}
 	name_checker = DirectoryChecker
 	mimetype_map = {}
 	extension_map = {}
@@ -137,12 +140,34 @@ class BaseExtractor(object):
 		if encoding:
 			self.pipe(self.decoders[encoding], 'decoding')
 		self.prepare()
-		logger.debug(f'[be] init f:{filename} enc:{encoding}')
+		# logger.debug(f'[be] init f:{filename} enc:{encoding}')
 
 	def pipe(self, command, description='extraction'):
 		self.pipes.append((command, description))
 
+	def timeout_check(self, pipe):
+		pass
+
+	def wait_for_exit(self, pipe):
+		while True:
+			try:
+				return pipe.wait(timeout=1)
+			except subprocess.TimeoutExpired:
+				logging.debug("timeout hit..")
+				self.timeout_check(pipe)
+				# Verify that we're not trying to extract password-protected
+				# archives in non-interactive mode
+				if self.pw_prompted and self.ignore_pw:
+					pipe.kill()
+					# Whatever extractor we're using probably left the
+					# terminal hiding output..
+					os.system("stty echo")
+					# Clean up the error output
+					self.stderr = ""
+					raise ExtractorError(f"cannot extract encrypted archive {self.filename} in non-interactive mode")
+
 	def add_process(self, processes, command, stdin, stdout):
+		logger.debug(f'[be] add_process: {command}')
 		try:
 			processes.append(subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=self.stderr))
 		except OSError as error:
@@ -170,6 +195,7 @@ class BaseExtractor(object):
 				stdout = subprocess.PIPE
 			self.add_process(processes, command, stdin, stdout)
 		self.exit_codes = [pipe.wait() for pipe in processes]
+		self.exit_codes = [self.wait_for_exit(pipe) for pipe in processes]
 		self.archive.close()
 		for index in range(last_pipe):
 			processes[index].stdout.close()
@@ -188,8 +214,8 @@ class BaseExtractor(object):
 			self.file_count += len(filenames)
 			path = path[start_index:]
 			for filename in filenames:
-				if (ExtractorBuilder.try_by_mimetype(self, filename) or
-					ExtractorBuilder.try_by_extension(self, filename)):
+				if (ExtractorBuilder.try_by_mimetype(filename) or
+					ExtractorBuilder.try_by_extension(filename)):
 					self.included_archives.append(os.path.join(path, filename))
 
 	def check_contents(self):
@@ -301,6 +327,38 @@ class BaseExtractor(object):
 		for process in processes:
 			process.stdout.close()
 		self.check_success(False)
+
+class NonblockingRead(object):
+	iostream = None
+
+	def __init__(self, iostream):
+		self.iostream = iostream
+
+		fd = iostream.fileno()
+		flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+		fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+	def python_2_readlines(self):
+		# XXX: There seems to be a bug in Python 2 where readline() returns
+		# "IOError: [Errno 11] Resource temporarily unavailable" on a
+		# non-blocking read from a pipe where the output lacks a newline.
+		# It doesn't happen in Python 3, so this hack can be deleted once we
+		# no longer care about Python 2.
+		out = ""
+		try:
+			while True:
+				# read a single byte at a time until we hit IOError
+				out += self.iostream.read(1).decode("ascii", "ignore")
+		except IOError:
+			pass
+		return out.splitlines(True)
+
+	def readlines(self):
+		if sys.version_info[0] >= 3:
+			out = self.iostream.readlines()
+			return [line.decode("ascii", "ignore") for line in out]
+		else:
+			return self.python_2_readlines()
 
 
 class CompressionExtractor(BaseExtractor):
@@ -472,6 +530,9 @@ class NoPipeExtractor(BaseExtractor):
 		self.list_pipe = self.list_command + [self.filename]
 		return BaseExtractor.get_filenames(self)
 
+	def __repr__(self):
+		return f'NoPipeExtractor({self.filename})'
+
 
 class ZipExtractor(NoPipeExtractor):
 	file_type = 'Zip file'
@@ -481,6 +542,18 @@ class ZipExtractor(NoPipeExtractor):
 	def is_fatal_error(self, status):
 		if status is not None:
 			return status > 1
+
+	def timeout_check(self, pipe):
+		nbs = NonblockingRead(pipe.stderr)
+		errs = nbs.readlines()
+
+		self.stderr += "".join(errs)
+
+		# pass through the password prompt, if unzip sent one
+		if errs and "password" in errs[-1]:
+			sys.stdout.write("\n" + errs[-1])
+			sys.stdout.flush()
+			self.pw_prompted = True
 
 
 class LZHExtractor(ZipExtractor):
@@ -531,6 +604,19 @@ class SevenExtractor(NoPipeExtractor):
 			elif fn_index is not None:
 				yield line[fn_index:]
 		self.archive.close()
+
+	def timeout_check(self, pipe):
+		nbs = NonblockingRead(pipe.stdout)
+		errs = nbs.readlines()
+
+		self.stderr += "".join(errs)
+
+		# pass through the password prompt, if 7z sent one
+		if errs and "password" in errs[-1]:
+			sys.stdout.write("\n" + errs[-1])
+			sys.stdout.flush()
+			self.pw_prompted = True
+
 
 
 class CABExtractor(NoPipeExtractor):
@@ -597,6 +683,72 @@ class RarExtractor(NoPipeExtractor):
 				yield line.split(' ')[1]
 		self.archive.close()
 
+	def timeout_check(self, pipe):
+		nbs = NonblockingRead(pipe.stdout)
+		errs = nbs.readlines()
+
+		self.stderr += "".join(errs)
+
+		# pass through the password prompt, if 7z sent one
+		if errs and "password" in errs[-1]:
+			sys.stdout.write("\n" + errs[-1])
+			sys.stdout.flush()
+			self.pw_prompted = True
+
+class UnarchiverExtractor(NoPipeExtractor):
+	file_type = "RAR archive"
+	extract_command = ["unar", "-D"]
+	list_command = ["lsar"]
+
+	def get_filenames(self):
+		output = NoPipeExtractor.get_filenames(self)
+		next(output)
+		for line in output:
+			end_index = line.rfind("(")
+			yield line[:end_index].strip()
+
+class ArjExtractor(NoPipeExtractor):
+	file_type = "ARJ archive"
+	extract_command = ["arj", "x", "-y"]
+	list_command = ["arj", "v"]
+	prefix_re = re.compile(r"^\d+\)\s+")
+
+	def get_filenames(self):
+		for line in NoPipeExtractor.get_filenames(self):
+			match = self.prefix_re.match(line)
+			if match:
+				yield line[match.end() :]
+		self.archive.close()
+
+class ZstandardExtractor(NoPipeExtractor):
+	file_type = "zstd file"
+	extract_command = ["zstd", "-d"]
+	list_command = ["zstd", "-l"]
+	border_re = re.compile("^[- ]+$")
+
+	def get_filenames(self):
+		fn_index = None
+		for line in NoPipeExtractor.get_filenames(self):
+			if self.border_re.match(line):
+				if fn_index is not None:
+					break
+				else:
+					fn_index = string.rindex(line, " ") + 1
+			elif fn_index is not None:
+				yield line[fn_index:]
+		self.archive.close()
+
+
+class BrotliExtractor(NoPipeExtractor):
+	file_type = "brotli file"
+	extract_command = ["brotli", "--decompress", "--output={OUTPUT_FILE}"]
+	# brotli command line doesn't support this mode
+	list_command = ["false"]
+
+	def get_filenames(self):
+		# just raise an error, this is not supported
+		raise ExtractorError
+
 
 class BaseHandler(object):
 	def __init__(self, extractor, options):
@@ -606,12 +758,10 @@ class BaseHandler(object):
 
 	def handle(self):
 		command = 'find'
-		status = subprocess.call(['find', self.extractor.target, '-type', 'd',
-								  '-exec', 'chmod', 'u+rwx', '{}', ';'])
+		status = subprocess.call(['find', self.extractor.target, '-type', 'd', '-exec', 'chmod', 'u+rwx', '{}', ';'])
 		if status == 0:
 			command = 'chmod'
-			status = subprocess.call(['chmod', '-R', 'u+rwX',
-									  self.extractor.target])
+			status = subprocess.call(['chmod', '-R', 'u+rwX', self.extractor.target])
 		if status != 0:
 			return '%s returned with exit status %s' % (command, status)
 		return self.organize()
@@ -717,7 +867,7 @@ class BombHandler(BaseHandler):
 		self.set_target(basename, self.extractor.name_checker)
 		os.rename(self.extractor.target, self.target)
 
-
+@total_ordering
 class BasePolicy(object):
 	try:
 		size = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ,
@@ -767,6 +917,11 @@ class BasePolicy(object):
 
 	def __cmp__(self, other):
 		return cmp(self.current_policy, other)
+	def __eq__(self, other):
+		return self.current_policy == other
+
+	def __lt__(self, other):
+		return self.current_policy < other
 
 
 class OneEntryPolicy(BasePolicy):
@@ -854,57 +1009,110 @@ class RecursionPolicy(BasePolicy):
 
 
 class ExtractorBuilder(object):
-	extractor_map = {'tar': {'extractors': (TarExtractor,),
-							 'mimetypes': ('x-tar',),
-							 'extensions': ('tar',),
-							 'magic': ('POSIX tar archive',)},
-					 'zip': {'extractors': (ZipExtractor, SevenExtractor),
-							 'mimetypes': ('zip',),
-							 'extensions': ('zip',),
-							 'magic': ('(Zip|ZIP self-extracting) archive',)},
-					 'lzh': {'extractors': (LZHExtractor,),
-							 'mimetypes': ('x-lzh', 'x-lzh-compressed'),
-							 'extensions': ('lzh', 'lha'),
-							 'magic': ('LHa [\d\.\?]+ archive',)},
-					 'rpm': {'extractors': (RPMExtractor,),
-							 'mimetypes': ('x-redhat-package-manager', 'x-rpm'),
-							 'extensions': ('rpm',),
-							 'magic': ('RPM',)},
-					 'deb': {'extractors': (DebExtractor,),
-							 'metadata': (DebMetadataExtractor,),
-							 'mimetypes': ('x-debian-package',),
-							 'extensions': ('deb',),
-							 'magic': ('Debian binary package',)},
-					 'cpio': {'extractors': (CpioExtractor,),
-							  'mimetypes': ('x-cpio',),
-							  'extensions': ('cpio',),
-							  'magic': ('cpio archive',)},
-					 'gem': {'extractors': (GemExtractor,),
-							 'metadata': (GemMetadataExtractor,),
-							 'mimetypes': ('x-ruby-gem',),
-							 'extensions': ('gem',)},
-					 '7z': {'extractors': (SevenExtractor,),
-							 'mimetypes': ('x-7z-compressed',),
-							 'extensions': ('7z',),
-							 'magic': ('7-zip archive',)},
-					 'cab': {'extractors': (CABExtractor,),
-							 'mimetypes': ('x-cab',),
-							 'extensions': ('cab',),
-							 'magic': ('Microsoft Cabinet Archive',)},
-					 'rar': {'extractors': (RarExtractor,),
-							 'mimetypes': ('rar',),
-							 'extensions': ('rar',),
-							 'magic': ('RAR archive',)},
-					 'shield': {'extractors': (ShieldExtractor,),
-								'mimetypes': ('x-cab',),
-								'extensions': ('cab', 'hdr'),
-								'magic': ('InstallShield CAB',)},
-					 'msi': {'extractors': (SevenExtractor,),
-							 'mimetypes': ('x-msi', 'x-ole-storage'),
-							 'extensions': ('msi',),
-							 'magic': ('Application: Windows Installer',)},
-					 'compress': {'extractors': (CompressionExtractor,)}
-					 }
+	extractor_map = {
+		"tar": {
+			"extractors": (TarExtractor,),
+			"mimetypes": ("x-tar",),
+			"extensions": ("tar",),
+			"magic": ("POSIX tar archive",),
+		},
+		"zip": {
+			"extractors": (ZipExtractor, SevenExtractor),
+			"mimetypes": ("zip",),
+			"extensions": ("zip", "jar", "epub", "xpi", "crx"),
+			"magic": ("(Zip|ZIP self-extracting) archive",),
+		},
+		"lzh": {
+			"extractors": (LZHExtractor,),
+			"mimetypes": ("x-lzh", "x-lzh-compressed"),
+			"extensions": ("lzh", "lha"),
+			"magic": (r"LHa [\d\.\?]+ archive",),
+		},
+		"rpm": {
+			"extractors": (RPMExtractor,),
+			"mimetypes": ("x-redhat-package-manager", "x-rpm"),
+			"extensions": ("rpm",),
+			"magic": ("RPM",),
+		},
+		"deb": {
+			"extractors": (DebExtractor,),
+			"metadata": (DebMetadataExtractor,),
+			"mimetypes": ("x-debian-package",),
+			"extensions": ("deb",),
+			"magic": ("Debian binary package",),
+		},
+		"cpio": {
+			"extractors": (CpioExtractor,),
+			"mimetypes": ("x-cpio",),
+			"extensions": ("cpio",),
+			"magic": ("cpio archive",),
+		},
+		"gem": {
+			"extractors": (GemExtractor,),
+			"metadata": (GemMetadataExtractor,),
+			"mimetypes": ("x-ruby-gem",),
+			"extensions": ("gem",),
+		},
+		"7z": {
+			"extractors": (SevenExtractor,),
+			"mimetypes": ("x-7z-compressed",),
+			"extensions": ("7z",),
+			"magic": ("7-zip archive",),
+		},
+		"cab": {
+			"extractors": (CABExtractor,),
+			"mimetypes": ("x-cab",),
+			"extensions": ("cab",),
+			"magic": ("Microsoft Cabinet Archive",),
+		},
+		"rar": {
+			"extractors": (RarExtractor, UnarchiverExtractor),
+			"mimetypes": ("rar",),
+			"extensions": ("rar",),
+			"magic": ("RAR archive",),
+		},
+		"arj": {
+			"extractors": (ArjExtractor,),
+			"mimetypes": ("arj",),
+			"extensions": ("arj",),
+			"magic": ("ARJ archive",),
+		},
+		"shield": {
+			"extractors": (ShieldExtractor,),
+			"mimetypes": ("x-cab",),
+			"extensions": ("cab", "hdr"),
+			"magic": ("InstallShield CAB",),
+		},
+		"msi": {
+			"extractors": (SevenExtractor,),
+			"mimetypes": ("x-msi", "x-ole-storage"),
+			"extensions": ("msi",),
+			"magic": ("Application: Windows Installer",),
+		},
+		"dmg": {
+			"extractors": (SevenExtractor,),
+			"mimetypes": ("x-apple-diskimage",),
+			"extensions": ("dmg",),
+			"magic": (
+				"ISO 9660 CD-ROM filesystem data",
+				"zlib compressed data",
+			),
+		},
+		"zst": {
+			"extractors": (ZstandardExtractor,),
+			"mimetypes": ("application/zstd",),
+			"extensions": (
+				"zst",
+				"zstd",
+			),
+			"magic": ("Zstandard compressed data",),
+		},
+		"brotli": {
+			"extractors": (BrotliExtractor,),
+			"extensions": ("br",),
+		},
+		"compress": {"extractors": (CompressionExtractor,)},
+	}
 
 	mimetype_map = {}
 	magic_mime_map = {}
@@ -919,25 +1127,34 @@ class ExtractorBuilder(object):
 		for extension in ext_info.get('extensions', ()):
 			extension_map.setdefault(extension, []).append((ext_name, None))
 
-	for mapping in (('tar', 'bzip2', 'tar.bz2', 'tbz2', 'tb2', 'tbz'),
-					('tar', 'gzip', 'tar.gz', 'tgz'),
-					('tar', 'lzma', 'tar.lzma', 'tlz'),
-					('tar', 'xz', 'tar.xz'),
-					('tar', 'lz', 'tar.lz'),
-					('tar', 'compress', 'tar.Z', 'taz'),
-					('compress', 'gzip', 'Z', 'gz'),
-					('compress', 'bzip2', 'bz2'),
-					('compress', 'lzma', 'lzma'),
-					('compress', 'xz', 'xz')):
+	for mapping in (
+		("tar", "bzip2", "tar.bz2", "tbz2", "tb2", "tbz"),
+		("tar", "gzip", "tar.gz", "tgz"),
+		("tar", "lzma", "tar.lzma", "tlz"),
+		("tar", "xz", "tar.xz", "txz"),
+		("tar", "lz", "tar.lz"),
+		("tar", "compress", "tar.Z", "taz"),
+		("tar", "lrz", "tar.lrz"),
+		("tar", "zstd", "tar.zst"),
+		("compress", "gzip", "Z", "gz"),
+		("compress", "bzip2", "bz2"),
+		("compress", "lzma", "lzma"),
+		("compress", "xz", "xz"),
+		("compress", "lrzip", "lrz"),
+	):
 		for extension in mapping[2:]:
 			extension_map.setdefault(extension, []).append(mapping[:2])
 
 	magic_encoding_map = {}
-	for mapping in (('bzip2', 'bzip2 compressed'),
-					('gzip', 'gzip compressed'),
-					('lzma', 'LZMA compressed'),
-					('lzip', 'lzip compressed'),
-					('xz', 'xz compressed')):
+	for mapping in (
+		("bzip2", "bzip2 compressed"),
+		("gzip", "gzip compressed"),
+		("lzma", "LZMA compressed"),
+		("lzip", "lzip compressed"),
+		("lrzip", "LRZIP compressed"),
+		("zstd", "Zstandard compressed"),
+		("xz", "xz compressed"),
+	):
 		for pattern in mapping[1:]:
 			magic_encoding_map[re.compile(pattern)] = mapping[0]
 
@@ -964,7 +1181,7 @@ class ExtractorBuilder(object):
 		for func_name in ('mimetype', 'extension', 'magic'):
 			logger.debug(f'getting extractors by {func_name}')
 			try:
-				extractor_types = getattr(self, 'try_by_' + func_name)(self,self.filename)
+				extractor_types = getattr(self, "try_by_" + func_name)(self.filename)
 			except AttributeError as e:
 				logger.error(f'[err] {e}')
 				return None
@@ -977,47 +1194,58 @@ class ExtractorBuilder(object):
 				for extractor in self.build_extractor(*ext_args):
 					yield extractor
 
-	def try_by_mimetype(self, cls, filename):
+	def try_by_mimetype(self, filename):
 		mimetype, encoding = mimetypes.guess_type(filename)
 		try:
-			return [(cls.mimetype_map[mimetype], encoding)]
+			return [(self.mimetype_map[mimetype], encoding)]
 		except KeyError:
 			if encoding:
-				return [('compress', encoding)]
+				return [("compress", encoding)]
 		return []
 	try_by_mimetype = classmethod(try_by_mimetype)
 
 	def magic_map_matches(self, cls=None, output=None, magic_map=None):
-		return [result for regexp, result in  list(magic_map.items())
-				if regexp.search(output)]
+		return [result for regexp, result in  list(magic_map.items()) if regexp.search(output)]
+
 	magic_map_matches = classmethod(magic_map_matches)
 
-	def try_by_magic(self, cls, filename):
-		process = subprocess.Popen(['file', '-z', filename], stdout=subprocess.PIPE)
-		status = process.wait()
-		if status != 0:
+	def try_by_magic(self, filename):
+		try:
+			process = subprocess.Popen(
+				["file", "-zL", filename], stdout=subprocess.PIPE
+			)
+			status = process.wait()
+			if status != 0:
+				return []
+		except FileNotFoundError as e:
+			logger.error(f"[!] {e} filename={filename} skipping magic test")
 			return []
-		output = str(process.stdout.readline())
+		output = process.stdout.readline().decode("ascii")
 		process.stdout.close()
-		if output.startswith('%s: ' % filename):
-			output = output[len(filename) + 2:]
-		mimes = cls.magic_map_matches(output=output, magic_map=cls.magic_mime_map)
-		encodings = cls.magic_map_matches(output, cls.magic_encsoding_map)
+		if output.startswith("%s: " % filename):
+			output = output[len(filename) + 2 :]
+		mimes = self.magic_map_matches(output, self.magic_mime_map)
+		encodings = self.magic_map_matches(output, self.magic_encoding_map)
 		if mimes and not encodings:
 			encodings = [None]
 		elif encodings and not mimes:
-			mimes = ['compress']
+			mimes = ["compress"]
 		return [(m, e) for m in mimes for e in encodings]
+
 	try_by_magic = classmethod(try_by_magic)
 
-	def try_by_extension(self, cls, filename):
-		parts = filename.split('.')[-2:]
+	def try_by_extension(self, filename):
+		parts = filename.split(".")[-2:]
 		results = []
+		if len(parts) == 1:
+			return results
 		while parts:
-			results.extend(cls.extension_map.get('.'.join(parts), []))
+			results.extend(self.extension_map.get(".".join(parts), []))
 			del parts[0]
 		return results
+
 	try_by_extension = classmethod(try_by_extension)
+
 
 
 class BaseAction(object):
@@ -1047,8 +1275,7 @@ class BaseAction(object):
 
 
 class ExtractionAction(BaseAction):
-	handlers = [FlatHandler, OverwriteHandler, MatchHandler, EmptyHandler,
-				BombHandler]
+	handlers = [FlatHandler, OverwriteHandler, MatchHandler, EmptyHandler, BombHandler]
 
 	def get_handler(self, extractor):
 		if extractor.content_type in ONE_ENTRY_UNKNOWN:
@@ -1070,7 +1297,7 @@ class ExtractionAction(BaseAction):
 			return cmp(y, x)
 		if self.current_handler.target == '.':
 			filenames = extractor.contents
-			filenames.sort()
+			filenames = sorted(filenames, key=cmp_to_key(reverser))
 		else:
 			filenames = [self.current_handler.target]
 		pathjoin = os.path.join
@@ -1096,6 +1323,8 @@ class ExtractionAction(BaseAction):
 			self.target = self.current_handler.target
 		logger.debug(f'[extact] f:{filename} ext:{extractor} err:{error}')
 		return error
+	def __repr__(self) -> str:
+		return f'ExtractorAction '
 
 
 class ListAction(BaseAction):
@@ -1120,6 +1349,9 @@ class ListAction(BaseAction):
 		if error and self.did_list:
 			logger.error('lister failed: ignore above listing for %s' % (filename,))
 		return error
+
+	def __repr__(self) -> str:
+		return f'ListAction {self.extractor}'
 
 
 class ExtractorApplication(object):
