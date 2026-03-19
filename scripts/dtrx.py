@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import operator
 import errno
 import fcntl
 import logging
+import itertools
 import mimetypes
 import optparse
 import os
@@ -104,8 +104,10 @@ class DirectoryChecker(FilenameChecker):
     free_close = None
 
     def create(self):
-        return tempfile.mkdtemp(prefix=self.original_name + ".", dir=".")
-
+        dirname = tempfile.mkdtemp(prefix=self.original_name + ".", dir=".")
+        # We want to directory to be relative to current directory
+        dirname = os.path.join(".", os.path.relpath(dirname))
+        return dirname
 
 class ExtractorError(Exception):
     pass
@@ -188,11 +190,7 @@ class BaseExtractor(object):
     def add_process(self, processes, command, stdin, stdout):
         logger.debug(f"[be] add_process: {command}")
         try:
-            processes.append(
-                subprocess.Popen(
-                    command, stdin=stdin, stdout=stdout, stderr=self.stderr
-                )
-            )
+            processes.append(subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=self.stderr))
         except OSError as error:
             logger.error(f"[err] {error}")
             if error.errno == errno.ENOENT:
@@ -284,12 +282,6 @@ class BaseExtractor(object):
             pieces.pop()
         return ".".join(pieces)
 
-    def get_stderr(self):
-        self.stderr.seek(0, 0)
-        errors = self.stderr.read(-1)
-        self.stderr.close()
-        return errors
-
     def is_fatal_error(self, status):
         return False
 
@@ -302,14 +294,9 @@ class BaseExtractor(object):
     def check_success(self, got_files):
         error_index, error_code = self.first_bad_exit_code()
         logger.debug(f"success results: {got_files}, {error_index}, {self.exit_codes}")
-        if self.is_fatal_error(error_code) or (
-            (not got_files) and (error_code is not None)
-        ):
+        if self.is_fatal_error(error_code) or ((not got_files) and (error_code is not None)):
             command = " ".join(self.pipes[error_index][0])
-            raise ExtractorError(
-                f"{self.pipes[error_index][1]}, {command}, {error_code}"
-            )
-            # raise ExtractorError('%s error: '%s' returned status code %s' % (self.pipes[error_index][1], command, error_code))
+            raise ExtractorError(f"{self.pipes[error_index][1]}, {command}, {error_code}")
 
     def extract_archive(self):
         self.pipe(self.extract_pipe)
@@ -329,9 +316,7 @@ class BaseExtractor(object):
             self.check_contents()
             self.check_success(self.content_type != EMPTY)
         except EXTRACTION_ERRORS as e:
-            logger.error(
-                f"[err] {e} oldpath:{old_path} st:{self.target} {self.archive}"
-            )
+            logger.error(f"[err] {e} oldpath:{old_path} st:{self.target} {self.archive}")
             self.archive.close()
             os.chdir(old_path)
             shutil.rmtree(self.target, ignore_errors=True)
@@ -576,12 +561,20 @@ class NoPipeExtractor(BaseExtractor):
 
 class ZipExtractor(NoPipeExtractor):
     file_type = "Zip file"
-    extract_command = ["unzip", "-q"]
     list_command = ["zipinfo", "-1"]
 
+    @property
+    def extract_command(self):
+        """
+        Returns the extraction command and adds a password if given.
+        """
+        cmd = ["unzip", "-q"]
+        if self.password:
+            cmd.append("-P %s" % (self.password,))
+        return cmd
+
     def is_fatal_error(self, status):
-        if status is not None:
-            return status > 1
+        return (status or 0) > 1
 
     def timeout_check(self, pipe):
         nbs = NonblockingRead(pipe.stderr)
@@ -594,7 +587,6 @@ class ZipExtractor(NoPipeExtractor):
             sys.stdout.write("\n" + errs[-1])
             sys.stdout.flush()
             self.pw_prompted = True
-
 
 class LZHExtractor(ZipExtractor):
     file_type = "LZH file"
@@ -614,7 +606,6 @@ class LZHExtractor(ZipExtractor):
 
     def get_filenames(self):
         filenames = NoPipeExtractor.get_filenames(self)
-        fn_index = None
         for line in filenames:
             fn_index = self.border_line_file_index(line)
             if fn_index is not None:
@@ -625,7 +616,6 @@ class LZHExtractor(ZipExtractor):
             else:
                 yield line[fn_index:]
         self.archive.close()
-
 
 class SevenExtractor(NoPipeExtractor):
     file_type = "7z file"
@@ -838,12 +828,11 @@ class BaseHandler(object):
 
 
 class FlatHandler(BaseHandler):
+    @staticmethod
     def can_handle(self, contents, options):
         return (options.flat and (contents != ONE_ENTRY_KNOWN)) or (
             options.overwrite and (contents == MATCHING_DIRECTORY)
         )
-
-    can_handle = staticmethod(can_handle)
 
     def organize(self):
         self.target = "."
@@ -864,12 +853,11 @@ class FlatHandler(BaseHandler):
 
 
 class OverwriteHandler(BaseHandler):
+    @staticmethod
     def can_handle(self, contents, options):
         return (options.flat and (contents == ONE_ENTRY_KNOWN)) or (
             options.overwrite and (contents != MATCHING_DIRECTORY)
         )
-
-    can_handle = staticmethod(can_handle)
 
     def organize(self):
         self.target = self.extractor.basename()
@@ -879,12 +867,11 @@ class OverwriteHandler(BaseHandler):
 
 
 class MatchHandler(BaseHandler):
+    @staticmethod
     def can_handle(self, contents, options):
         return (contents == MATCHING_DIRECTORY) or (
             (contents in ONE_ENTRY_UNKNOWN) and options.one_entry_policy.ok_for_match()
         )
-
-    can_handle = staticmethod(can_handle)
 
     def organize(self):
         source = os.path.join(
@@ -910,10 +897,9 @@ class MatchHandler(BaseHandler):
 class EmptyHandler(object):
     target = ""
 
+    @staticmethod
     def can_handle(self, contents, options):
         return contents == EMPTY
-
-    can_handle = staticmethod(can_handle)
 
     def __init__(self, extractor, options):
         os.rmdir(extractor.target)
@@ -923,10 +909,9 @@ class EmptyHandler(object):
 
 
 class BombHandler(BaseHandler):
+    @staticmethod
     def can_handle(self, contents, options):
         return True
-
-    can_handle = staticmethod(can_handle)
 
     def organize(self):
         basename = self.extractor.basename()
@@ -1285,7 +1270,7 @@ class ExtractorBuilder(object):
             except AttributeError as e:
                 logger.error(f"[err] {e}")
                 return None
-            # logger.debug('done getting extractors')
+
             for ext_args in extractor_types:
                 if ext_args in tried_types:
                     continue
@@ -1316,17 +1301,25 @@ class ExtractorBuilder(object):
 
     def try_by_magic(self, filename):
         try:
-            process = subprocess.Popen(
-                ["file", "-zL", filename], stdout=subprocess.PIPE
-            )
-            status = process.wait()
-            if status != 0:
+            # process = subprocess.Popen(["file", "-zL", filename], stdout=subprocess.PIPE)
+            result = subprocess.run(["file", "-zL", filename], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, )
+            if result.returncode != 0:
                 return []
+            # status = process.wait()
+            # if status != 0:
+            #    return []
         except FileNotFoundError as e:
             logger.error(f"[!] {e} filename={filename} skipping magic test")
             return []
-        output = process.stdout.readline().decode("ascii")
-        process.stdout.close()
+        # output = process.stdout.readline().decode("ascii")
+        output = result.stdout.split("\n")[0]
+        if "ERROR:[" in output:
+            result = subprocess.run(["file", "-L", filename], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,)
+            if result.returncode != 0:
+                return []
+            output = result.stdout.split("\n")[0]
+
+        # process.stdout.close()
         if output.startswith("%s: " % filename):
             output = output[len(filename) + 2:]
         mimes = self.magic_map_matches(output, self.magic_mime_map)
@@ -1413,10 +1406,8 @@ class ExtractionAction(BaseAction):
             if isdir(filename):
                 print("%s/" % (filename,))
                 new_filenames = os.listdir(filename)
-                new_filenames.sort()
-                filenames.extend(
-                    [pathjoin(filename, new_filename) for new_filename in new_filenames]
-                )
+                new_filenames = sorted(new_filenames, key=cmp_to_key(reverser))
+                filenames.extend([pathjoin(filename, new_filename) for new_filename in new_filenames])
             else:
                 print(filename)
 
@@ -1485,10 +1476,7 @@ class ExtractorApplication(object):
     def abort(self, signal_num, frame):
         signal.signal(signal_num, signal.SIG_IGN)
         # print('')
-        logger.debug(
-            f"traceback: {traceback.format_stack(frame)} sig:{signal_num}"
-        )  # + ''.join(traceback.format_stack(frame)).rstrip())
-        # logger.debug('got signal %s' % (signal_num,))
+        logger.debug(f"traceback: {traceback.format_stack(frame)} sig:{signal_num}")  # + ''.join(traceback.format_stack(frame)).rstrip())
         try:
             basename = self.current_extractor.target
         except AttributeError as e:
@@ -1502,6 +1490,37 @@ class ExtractorApplication(object):
             for directory in clean_targets:
                 self.clean_destination(os.path.join(directory, basename))
         sys.exit(1)
+
+    @staticmethod
+    def get_supported_extensions():
+        """
+        return supported extensions
+        """
+        # get the lists of built-in extensions and combine them
+        ext_map_base = set(ExtractorBuilder.extension_map.keys())
+        ext_map = set(
+            itertools.chain(
+                *[
+                    x["extensions"]
+                    for x in ExtractorBuilder.extractor_map.values()
+                    if "extensions" in x
+                ]
+            )
+        )
+        ext_map = ext_map_base.union(ext_map)
+
+        # get the list of extensions supplied by mimetypes
+        mimetypes_encodings_map = set([x.lstrip(".") for x in mimetypes.encodings_map])
+        # dtrx only supports a subset of the total types_map set, filter it
+        mimetypes_exts = filter(
+            lambda x: mimetypes.types_map[x] in ExtractorBuilder.mimetype_map,
+            mimetypes.types_map,
+        )
+        mimetypes_exts = set([x.lstrip(".") for x in mimetypes_exts])
+        mimetypes_exts = mimetypes_encodings_map.union(mimetypes_exts)
+
+        # sort the output for consistent order
+        return sorted(ext_map.union(mimetypes_exts))
 
     def parse_options(self, arguments):
         parser = optparse.OptionParser(
@@ -1586,6 +1605,24 @@ class ExtractorApplication(object):
             default=3,
             help="suppress warning/error messages",
         )
+
+        def list_extensions(option, opt, value, parser, *args, **kwargs):
+            """callback for optparse to list supported extensions"""
+            print("\n".join(ExtractorApplication.get_supported_extensions()))
+            sys.exit()
+        parser.add_option(
+            "--list-extensions",
+            action="callback",
+            callback=list_extensions,
+            help=(
+                "list supported filetypes by extension. note that these are the"
+                " filetypes recognized by dtrx, but extraction still relies on the"
+                " appropriate tool to be installed. also note that this is not a"
+                " comprehensive list; dtrx will fall back on the 'file' command if the"
+                " extension is unknown"
+            ),
+        )
+
         self.options, filenames = parser.parse_args(arguments)
         if not filenames:
             parser.error("you did not list any archives")
@@ -1604,18 +1641,13 @@ class ExtractorApplication(object):
         handler.setLevel(self.options.log_level)
         formatter = logging.Formatter("dtrx: %(levelname)s: %(message)s")
         handler.setFormatter(formatter)
-        # logger.addHandler(handler)
-        # logger.debug('logger is set up')
 
     def recurse(self, filename, extractor, action):
         self.options.recursion_policy.prep(filename, action.target, extractor)
         if self.options.recursion_policy.ok_to_recurse():
             for filename in extractor.included_archives:
-                logger.debug(f"recursing with {extractor.content_type} archive")
                 tail_path, basename = os.path.split(filename)
                 path_args = [self.current_directory, extractor.included_root, tail_path]
-                logger.debug(f"included root: {extractor.included_root}")
-                logger.debug(f"tail path: {tail_path}")
                 if os.path.isdir(action.target):
                     logger.debug(f"action target: {action.target}")
                     path_args.insert(1, action.target)
@@ -1632,7 +1664,6 @@ class ExtractorApplication(object):
             return "cannot work with a directory"
 
     def show_stderr(self, logger_func, stderr):
-        # logger.warning(f'[showstderr] {logger_func} {stderr}')
         if stderr:
             logger_func(f"Error output from this process: {stderr}")
 
@@ -1642,24 +1673,12 @@ class ExtractorApplication(object):
             self.current_extractor = extractor  # For the abort() method.
             error = self.action.run(filename, extractor)
             if error:
-                logger.warning(
-                    f"[tryext] {error} extr:{extractor} b:{builder} fn:{filename}"
-                )
-                errors.append(
-                    (
-                        extractor.file_type,
-                        extractor.encoding,
-                        error,
-                        extractor.get_stderr(),
-                    )
-                )
+                logger.warning(f"[tryext] {error} extr:{extractor} b:{builder} fn:{filename}")
+                errors.append((extractor.file_type, extractor.encoding, error, extractor.stderr))
                 if extractor.target is not None:
                     self.clean_destination(extractor.target)
             else:
-                logger.info(
-                    f"[tryext] {filename} extracted with {extractor.file_type} {extractor.encoding} {error}"
-                )
-                # self.show_stderr(logger.warning, extractor.get_stderr())
+                logger.info(f"[tryext] {filename} extracted with {extractor.file_type} {extractor.encoding} {error}")
                 self.recurse(filename, extractor, self.action)
                 return
         logger.error(f"could not handle {filename}")
@@ -1671,7 +1690,6 @@ class ExtractorApplication(object):
             if encoding:
                 message.insert(1, "%s-encoded" % (encoding,))
             logger.error(f"[err] {message}")
-            # self.show_stderr(logger.error, stderr)
         return True
 
     def download(self, filename):
@@ -1697,16 +1715,12 @@ class ExtractorApplication(object):
         while self.archives:
             self.current_directory, self.filenames = self.archives.popitem()
             os.chdir(self.current_directory)
-            logger.debug(
-                f"[run] a:{self.action} cwd:{self.current_directory} fns:{self.filenames}"
-            )
+            logger.debug(f"[run] a:{self.action} cwd:{self.current_directory} fns:{self.filenames}")
             for filename in self.filenames:
                 filename, error = self.download(filename)
                 if not error:
                     builder = ExtractorBuilder(filename, self.options)
-                    error = self.check_file(filename) or self.try_extractors(
-                        filename, builder.get_extractor()
-                    )
+                    error = self.check_file(filename) or self.try_extractors(filename, builder.get_extractor())
                     logger.debug(f"builder {builder}")
                 if error:
                     if error is not True:
